@@ -14,6 +14,8 @@ __pycache__/
 # audio
 *.wav
 *.mp3
+*.mp4
+*.avi
 
 # logs
 *.log
@@ -39,6 +41,8 @@ logs/tensorboard/
 # OS
 .DS_Store
 Thumbs.db
+*.zip
+*.rar
 
 新しいフォルダー/
 コマンド早見表.txt
