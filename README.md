@@ -4,6 +4,12 @@
 [![Demo](https://img.shields.io/badge/Demo-HuggingFace%20Space-blue)](https://huggingface.co/spaces/Aratako/Irodori-TTS-500M-Demo)
 [![License: MIT](https://img.shields.io/badge/Code%20License-MIT-green.svg)](LICENSE)
 
+本プログラムはAratako/Irodori-TTS様のプログラムを元にしたものです。学習モデルは商用利用禁止なので自動ダウンロードで対応しています。
+
+readme.txtにメモ情報があります。機能紹介などは後回しになっているのでオリジナル原文のままです。目玉はデータセットツールとなります。
+
+GithubもClaudeも初心者で拙い部分があるのはご了承ください。
+
 Training and inference code for **Irodori-TTS**, a Flow Matching-based Text-to-Speech model. The architecture and training design largely follow [Echo-TTS](https://jordandarefsky.com/blog/2025/echo/), using [DACVAE](https://github.com/facebookresearch/dacvae) continuous latents as the generation target.
 
 For model weights and audio samples, please refer to the [model card](https://huggingface.co/Aratako/Irodori-TTS-500M).
