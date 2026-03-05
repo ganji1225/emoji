@@ -397,7 +397,8 @@ def _run_generation(
     cfg_scale_raw, cfg_min_t, cfg_max_t, context_kv_cache,
     truncation_factor_raw, rescale_k_raw, rescale_sigma_raw,
     speaker_kv_scale_raw, speaker_kv_min_t_raw, speaker_kv_max_layers_raw,
-) -> tuple[str | None, str, str]:
+    num_candidates: int = 1,
+) -> tuple[list[tuple[str, str]], str, str]:
     def stdout_log(msg: str) -> None:
         print(msg, flush=True)
 
@@ -416,38 +417,64 @@ def _run_generation(
 
     ref_wav = str(uploaded_audio) if uploaded_audio and str(uploaded_audio).strip() else None
     no_ref  = ref_wav is None
+    num_candidates = max(1, int(num_candidates))
 
     runtime, reloaded = get_cached_runtime(runtime_key)
     stdout_log(f"[gradio] runtime: {'reloaded' if reloaded else 'reused'}")
 
-    result = runtime.synthesize(
-        SamplingRequest(
-            text=str(text), ref_wav=ref_wav, ref_latent=None, no_ref=bool(no_ref),
-            seconds=FIXED_SECONDS, max_ref_seconds=30.0, max_text_len=None,
-            num_steps=int(num_steps), seed=None if seed is None else int(seed),
-            cfg_guidance_mode=str(cfg_guidance_mode),
-            cfg_scale_text=float(cfg_scale_text), cfg_scale_speaker=float(cfg_scale_speaker),
-            cfg_scale=cfg_scale, cfg_min_t=float(cfg_min_t), cfg_max_t=float(cfg_max_t),
-            truncation_factor=truncation_factor, rescale_k=rescale_k, rescale_sigma=rescale_sigma,
-            context_kv_cache=bool(context_kv_cache),
-            speaker_kv_scale=speaker_kv_scale, speaker_kv_min_t=speaker_kv_min_t,
-            speaker_kv_max_layers=speaker_kv_max_layers, trim_tail=True,
-            lora_scale=float(lora_scale) if runtime_key.lora_path else 1.0,
-        ),
-        log_fn=stdout_log,
-    )
-
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    stamp    = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    out_path = save_wav(OUTPUTS_DIR / f"sample_{stamp}.wav", result.audio.float(), result.sample_rate)
 
-    detail_text = "\n".join([
+    # 複数候補を順番に生成する
+    # シード指定がある場合は candidate_index をオフセットとして加算し再現性を確保
+    gallery_items: list[tuple[str, str]] = []
+    all_detail_lines: list[str] = [
         "runtime: reloaded" if reloaded else "runtime: reused",
-        f"seed_used: {result.used_seed}", f"saved: {out_path}", *result.messages,
-    ])
-    timing_text = _format_timings(result.stage_timings, result.total_to_decode)
-    stdout_log(f"[gradio] saved: {out_path}")
-    return str(out_path), detail_text, timing_text
+    ]
+    last_timing_text = ""
+
+    for i in range(num_candidates):
+        candidate_seed = None if seed is None else (seed + i)
+        stdout_log(f"[gradio] generating candidate {i + 1}/{num_candidates} ...")
+
+        result = runtime.synthesize(
+            SamplingRequest(
+                text=str(text), ref_wav=ref_wav, ref_latent=None, no_ref=bool(no_ref),
+                seconds=FIXED_SECONDS, max_ref_seconds=30.0, max_text_len=None,
+                num_steps=int(num_steps),
+                seed=candidate_seed,
+                cfg_guidance_mode=str(cfg_guidance_mode),
+                cfg_scale_text=float(cfg_scale_text), cfg_scale_speaker=float(cfg_scale_speaker),
+                cfg_scale=cfg_scale, cfg_min_t=float(cfg_min_t), cfg_max_t=float(cfg_max_t),
+                truncation_factor=truncation_factor, rescale_k=rescale_k, rescale_sigma=rescale_sigma,
+                context_kv_cache=bool(context_kv_cache),
+                speaker_kv_scale=speaker_kv_scale, speaker_kv_min_t=speaker_kv_min_t,
+                speaker_kv_max_layers=speaker_kv_max_layers, trim_tail=True,
+                lora_scale=float(lora_scale) if runtime_key.lora_path else 1.0,
+            ),
+            log_fn=stdout_log,
+        )
+
+        stamp    = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        out_path = save_wav(
+            OUTPUTS_DIR / f"sample_{stamp}_c{i + 1}.wav",
+            result.audio.float(),
+            result.sample_rate,
+        )
+        # ギャラリーアイテム: (ファイルパス, キャプション)
+        caption = f"候補 {i + 1}  seed={result.used_seed}"
+        gallery_items.append((str(out_path), caption))
+
+        all_detail_lines.append(
+            f"[候補 {i + 1}] seed={result.used_seed}  saved={out_path}"
+        )
+        for msg in result.messages:
+            all_detail_lines.append(f"  {msg}")
+
+        last_timing_text = _format_timings(result.stage_timings, result.total_to_decode)
+        stdout_log(f"[gradio] candidate {i + 1} saved: {out_path}")
+
+    detail_text = "\n".join(all_detail_lines)
+    return gallery_items, detail_text, last_timing_text
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1590,6 +1617,123 @@ def _run_lora_convert(input_full_dir: str, force: bool = False) -> str:
 # UI 構築
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ダークモード切り替え用 CSS / JS（モジュールトップレベル）
+# ─────────────────────────────────────────────────────────────────────────────
+_DARK_CSS = """
+/* ── ダークモード変数 ── */
+.dark-mode {
+    --bg-primary:    #1a1a1a;
+    --bg-secondary:  #2a2a2a;
+    --bg-tertiary:   #333333;
+    --text-primary:  #e8e8e8;
+    --text-secondary:#aaaaaa;
+    --border-color:  #444444;
+    --accent:        #7c9cbf;
+}
+.dark-mode .gradio-container,
+.dark-mode body {
+    background-color: var(--bg-primary) !important;
+    color: var(--text-primary) !important;
+}
+.dark-mode .gr-box,
+.dark-mode .gr-panel,
+.dark-mode .gr-form,
+.dark-mode .gr-block,
+.dark-mode .block,
+.dark-mode .panel,
+.dark-mode fieldset {
+    background-color: var(--bg-secondary) !important;
+    border-color: var(--border-color) !important;
+}
+.dark-mode .tab-nav button,
+.dark-mode .tabs > .tab-nav > button {
+    background-color: var(--bg-tertiary) !important;
+    color: var(--text-primary) !important;
+    border-color: var(--border-color) !important;
+}
+.dark-mode .tab-nav button.selected {
+    background-color: var(--accent) !important;
+    color: #ffffff !important;
+}
+.dark-mode input,
+.dark-mode textarea,
+.dark-mode select,
+.dark-mode .gr-textbox textarea,
+.dark-mode .gr-textbox input {
+    background-color: var(--bg-tertiary) !important;
+    color: var(--text-primary) !important;
+    border-color: var(--border-color) !important;
+}
+.dark-mode label,
+.dark-mode .gr-label,
+.dark-mode .label-wrap span {
+    color: var(--text-secondary) !important;
+}
+.dark-mode .gr-button-secondary,
+.dark-mode button.secondary {
+    background-color: var(--bg-tertiary) !important;
+    color: var(--text-primary) !important;
+    border-color: var(--border-color) !important;
+}
+.dark-mode .gr-accordion,
+.dark-mode details,
+.dark-mode details summary {
+    background-color: var(--bg-secondary) !important;
+    color: var(--text-primary) !important;
+    border-color: var(--border-color) !important;
+}
+.dark-mode .gr-slider input[type=range] {
+    accent-color: var(--accent) !important;
+}
+.dark-mode .gr-dropdown,
+.dark-mode .wrap {
+    background-color: var(--bg-tertiary) !important;
+    color: var(--text-primary) !important;
+    border-color: var(--border-color) !important;
+}
+#dark-mode-toggle-btn {
+    position: fixed;
+    top: 12px;
+    right: 18px;
+    z-index: 9999;
+    padding: 5px 14px;
+    border-radius: 20px;
+    border: 1px solid #888;
+    background: #f0f0f0;
+    color: #333;
+    font-size: 13px;
+    cursor: pointer;
+    transition: background 0.2s, color 0.2s;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+}
+.dark-mode #dark-mode-toggle-btn {
+    background: #444 !important;
+    color: #eee !important;
+    border-color: #666 !important;
+}
+"""
+
+_DARK_JS = """
+function() {
+    if (!document.getElementById('dark-mode-toggle-btn')) {
+        var btn = document.createElement('button');
+        btn.id = 'dark-mode-toggle-btn';
+        btn.textContent = '🌙 ダーク';
+        document.body.appendChild(btn);
+        if (localStorage.getItem('irodori_dark') === '1') {
+            document.body.classList.add('dark-mode');
+            btn.textContent = '☀️ ライト';
+        }
+        btn.addEventListener('click', function() {
+            var isDark = document.body.classList.toggle('dark-mode');
+            btn.textContent = isDark ? '☀️ ライト' : '🌙 ダーク';
+            localStorage.setItem('irodori_dark', isDark ? '1' : '0');
+        });
+    }
+}
+"""
+
 def build_ui() -> gr.Blocks:
     _ensure_default_model()
 
@@ -1609,6 +1753,8 @@ def build_ui() -> gr.Blocks:
 
     def _v(key, fallback=None):
         return default_cfg.get(key, fallback)
+
+    # ダークモードCSS/JSはモジュールトップレベル (_DARK_CSS/_DARK_JS) で定義
 
     with gr.Blocks(title="Irodori-TTS GUI") as demo:
         gr.Markdown("# 🎙️ Irodori-TTS GUI")
@@ -1666,39 +1812,269 @@ def build_ui() -> gr.Blocks:
 
                 gr.Markdown("## 音声生成")
                 infer_text = gr.Textbox(label="テキスト（合成したい文章）", lines=4)
-                infer_audio = gr.Audio(label="参照音声（省略するとno-referenceモードになります）", type="filepath")
+                with gr.Accordion("🎤 参照音声（省略するとno-referenceモードで生成）", open=False):
+                    infer_audio = gr.Audio(label="参照音声", type="filepath")
 
+                # ── 感情スタイルプリセット ──────────────────────────────
+                with gr.Accordion("🎭 感情スタイル", open=True):
+                    gr.Markdown(
+                        "プリセットボタンを押すと、下の各パラメータが自動設定されます。"
+                        "その後スライダーを手動調整することも可能です。"
+                    )
+                    with gr.Row():
+                        preset_normal  = gr.Button("😐 ノーマル",   variant="secondary", scale=1)
+                        preset_strong  = gr.Button("😤 力強く",     variant="secondary", scale=1)
+                        preset_calm    = gr.Button("😌 おとなしく", variant="secondary", scale=1)
+                        preset_bright  = gr.Button("😊 明るく",     variant="secondary", scale=1)
+                        preset_whisper = gr.Button("🤫 ひそやかに", variant="secondary", scale=1)
+
+                    gr.Markdown("##### スタイル調整パラメータ")
+                    with gr.Row():
+                        style_cfg_text = gr.Slider(
+                            label="テキスト表現力（低：棒読み ↔ 高：抑揚強調）",
+                            minimum=0.0, maximum=10.0, value=3.0, step=0.1, scale=2,
+                        )
+                        style_cfg_speaker = gr.Slider(
+                            label="感情の強さ（低：ニュートラル ↔ 高：スタイル強調）",
+                            minimum=0.0, maximum=10.0, value=5.0, step=0.1, scale=2,
+                        )
+                    with gr.Row():
+                        style_kv_scale = gr.Slider(
+                            label="話者密着度（1.0=標準、高いほど参照音声の特徴を強く反映）",
+                            minimum=1.0, maximum=4.0, value=1.0, step=0.1, scale=2,
+                        )
+                        style_trunc = gr.Slider(
+                            label="表現の振れ幅（低：安定・平坦 ↔ 高：ダイナミック・不安定）",
+                            minimum=0.7, maximum=1.0, value=1.0, step=0.01, scale=2,
+                        )
+
+                # ── サンプリング設定 ────────────────────────────────────
                 with gr.Accordion("🎛️ サンプリング設定", open=True):
                     with gr.Row():
-                        num_steps = gr.Slider(label="ステップ数（多いほど品質向上、遅くなる）", minimum=1, maximum=120, value=40, step=1)
-                        seed_raw  = gr.Textbox(label="シード（空白=ランダム）", value="")
+                        num_steps = gr.Slider(
+                            label="ステップ数（多いほど品質向上・低速）",
+                            minimum=1, maximum=120, value=40, step=1,
+                        )
+                        seed_raw = gr.Textbox(label="シード（空白=ランダム）", value="")
+
+                # ── CFG設定 ─────────────────────────────────────────────
+                with gr.Accordion("⚙️ CFG設定", open=False):
+                    gr.Markdown(
+                        "**CFG（Classifier-Free Guidance）** はモデルが条件（テキスト・話者）をどれだけ"
+                        "強く守るかを制御します。値が大きいほど条件に忠実になりますが、高すぎると"
+                        "不自然になる場合があります。"
+                    )
                     with gr.Row():
                         cfg_guidance_mode = gr.Dropdown(
-                            label="CFGガイダンスモード（independent=高品質/遅い、joint=バランス、alternating=高速）",
-                            choices=["independent", "joint", "alternating"], value="independent",
+                            label="ガイダンスモード",
+                            choices=["independent", "joint", "alternating"],
+                            value="independent",
+                            info="independent=高品質・低速（推奨） / joint=バランス / alternating=高速",
                         )
-                        cfg_scale_text    = gr.Slider(label="CFGスケール: テキスト条件の強度", minimum=0.0, maximum=10.0, value=3.0, step=0.1)
-                        cfg_scale_speaker = gr.Slider(label="CFGスケール: 話者条件の強度", minimum=0.0, maximum=10.0, value=5.0, step=0.1)
+                        cfg_scale_text = gr.Slider(
+                            label="テキストCFG強度",
+                            minimum=0.0, maximum=10.0, value=3.0, step=0.1,
+                            info="テキスト内容への忠実度。感情スタイルと連動します。",
+                        )
+                        cfg_scale_speaker = gr.Slider(
+                            label="話者CFG強度",
+                            minimum=0.0, maximum=10.0, value=5.0, step=0.1,
+                            info="参照音声の声質への忠実度。感情スタイルと連動します。",
+                        )
 
+                # ── 詳細設定 ────────────────────────────────────────────
                 with gr.Accordion("🔬 詳細設定（上級者向け）", open=False):
-                    cfg_scale_raw = gr.Textbox(label="CFGスケール一括上書き（テキスト・話者を同値に設定）", value="")
+                    gr.Markdown(
+                        "通常は変更不要です。動作確認・実験用途向けの項目です。"
+                    )
+                    cfg_scale_raw = gr.Textbox(
+                        label="CFGスケール一括上書き（テキスト・話者を同値に設定。空=無効）",
+                        value="",
+                    )
                     with gr.Row():
-                        cfg_min_t       = gr.Number(label="CFG適用開始タイムステップ", value=0.5)
-                        cfg_max_t       = gr.Number(label="CFG適用終了タイムステップ", value=1.0)
-                        context_kv_cache= gr.Checkbox(label="コンテキストKVキャッシュ（推論高速化）", value=True)
+                        cfg_min_t = gr.Number(
+                            label="CFG適用開始タイムステップ",
+                            value=0.5,
+                            info="拡散過程のどの時点からCFGを適用するか（0.0〜1.0）",
+                        )
+                        cfg_max_t = gr.Number(
+                            label="CFG適用終了タイムステップ",
+                            value=1.0,
+                            info="拡散過程のどの時点までCFGを適用するか（0.0〜1.0）",
+                        )
+                        context_kv_cache = gr.Checkbox(
+                            label="コンテキストKVキャッシュ（推論高速化）",
+                            value=True,
+                            info="テキスト・話者のKV射影を事前計算してステップ間で再利用します",
+                        )
                     with gr.Row():
-                        truncation_factor_raw= gr.Textbox(label="切り捨て係数（0.8〜0.9で平坦化。空=無効）", value="")
-                        rescale_k_raw        = gr.Textbox(label="時間的スコア再スケールk（空=無効）", value="")
-                        rescale_sigma_raw    = gr.Textbox(label="時間的スコア再スケールsigma（空=無効）", value="")
+                        rescale_k_raw = gr.Textbox(
+                            label="スコア再スケールk（空=無効）",
+                            value="",
+                            info="Xu et al. 2025 の時間的スコアリスケール係数k",
+                        )
+                        rescale_sigma_raw = gr.Textbox(
+                            label="スコア再スケールsigma（空=無効）",
+                            value="",
+                            info="rescale_k と合わせて設定します",
+                        )
                     with gr.Row():
-                        speaker_kv_scale_raw    = gr.Textbox(label="話者KVスケール（>1で話者性強調。空=無効）", value="")
-                        speaker_kv_min_t_raw    = gr.Textbox(label="話者KVスケール適用閾値（デフォルト0.9）", value="0.9")
-                        speaker_kv_max_layers_raw= gr.Textbox(label="話者KVスケール適用レイヤー数上限（空=全レイヤー）", value="")
+                        speaker_kv_min_t_raw = gr.Textbox(
+                            label="話者KVスケール適用閾値（デフォルト0.9）",
+                            value="0.9",
+                            info="この値以上のタイムステップでのみ話者KV強調を適用します",
+                        )
+                        speaker_kv_max_layers_raw = gr.Textbox(
+                            label="話者KVスケール適用レイヤー数上限（空=全レイヤー）",
+                            value="",
+                            info="拡散ブロックの先頭N層にのみ話者KV強調を適用します",
+                        )
+
+                    # 感情スタイルパネルと詳細設定の内部変数をつなぐ隠しフィールド
+                    # truncation_factor と speaker_kv_scale はスタイルパネルから制御するため
+                    # 詳細設定には表示しない（テキストボックスは後処理用に内部保持）
+                    truncation_factor_raw = gr.Textbox(visible=False, value="")
+                    speaker_kv_scale_raw  = gr.Textbox(visible=False, value="")
+
+                # ── 候補数設定 ──────────────────────────────────────────
+                num_candidates = gr.Slider(
+                    label="生成候補数 (Num Candidates)",
+                    minimum=1, maximum=8, value=1, step=1,
+                    info="1回の生成で作成する候補音声の数。シード指定時は seed, seed+1, seed+2... が使われます。",
+                )
 
                 generate_btn = gr.Button("🎵 生成", variant="primary", size="lg")
-                out_audio   = gr.Audio(label="生成音声", type="filepath")
-                out_log     = gr.Textbox(label="実行ログ", lines=6)
-                out_timing  = gr.Textbox(label="タイミング情報", lines=6)
+
+                # ── 候補リスト（最大8候補）──────────────────────────
+                _MAX_CANDIDATES = 8
+                gr.Markdown("### 生成結果")
+                gr.Markdown(
+                    "各候補の再生ボタンで試聴できます。"
+                    "ファイルは `gradio_outputs/` フォルダに保存されています。"
+                )
+
+                # 候補ごとに (ラベルTextbox + Audioプレイヤー) を最大8セット用意し
+                # 生成数に応じて visible を切り替える
+                _cand_labels = []
+                _cand_audios = []
+                for _ci in range(_MAX_CANDIDATES):
+                    with gr.Row(visible=False) as _row:
+                        pass
+                    _lbl = gr.Textbox(
+                        value="",
+                        label=f"候補 {_ci + 1}",
+                        interactive=False,
+                        visible=False,
+                        max_lines=1,
+                        show_label=True,
+                        scale=1,
+                    )
+                    _aud = gr.Audio(
+                        value=None,
+                        label=f"候補 {_ci + 1} の音声",
+                        type="filepath",
+                        interactive=False,
+                        visible=False,
+                        scale=3,
+                    )
+                    _cand_labels.append(_lbl)
+                    _cand_audios.append(_aud)
+
+                out_log    = gr.Textbox(label="実行ログ", lines=6)
+                out_timing = gr.Textbox(label="タイミング情報", lines=6)
+
+                # _run_generation の戻り値 (gallery_items, detail, timing) を
+                # 候補ラベル×8 + 候補Audio×8 + log + timing に展開するラッパー
+                def _run_generation_ui(*args):
+                    gallery_items, detail_text, timing_text = _run_generation(*args)
+                    label_updates = []
+                    audio_updates = []
+                    for i in range(_MAX_CANDIDATES):
+                        if i < len(gallery_items):
+                            path, caption = gallery_items[i]
+                            label_updates.append(gr.update(value=caption, visible=True))
+                            audio_updates.append(gr.update(value=path, visible=True))
+                        else:
+                            label_updates.append(gr.update(value="", visible=False))
+                            audio_updates.append(gr.update(value=None, visible=False))
+                    return label_updates + audio_updates + [detail_text, timing_text]
+
+                # ── プリセット定義 ──────────────────────────────────────
+                # (cfg_text, cfg_speaker, kv_scale, trunc)
+                _PRESETS = {
+                    "normal":  (3.0, 5.0, 1.0, 1.0),
+                    "strong":  (5.0, 7.0, 1.8, 1.0),
+                    "calm":    (2.0, 3.0, 1.0, 0.80),
+                    "bright":  (4.5, 6.0, 1.5, 0.95),
+                    "whisper": (2.0, 2.0, 1.0, 0.75),
+                }
+
+                def _apply_preset(name):
+                    ct, cs, kv, tr = _PRESETS[name]
+                    # kv_scale: 1.0のときは空文字（無効）、それ以外は文字列で返す
+                    kv_str = "" if kv == 1.0 else str(kv)
+                    # trunc: 1.0のときは空文字（無効）、それ以外は文字列で返す
+                    tr_str = "" if tr == 1.0 else str(tr)
+                    return ct, cs, ct, cs, kv, tr, kv_str, tr_str
+
+                # プリセットが更新するコンポーネントのリスト
+                _preset_outputs = [
+                    style_cfg_text, style_cfg_speaker,
+                    cfg_scale_text, cfg_scale_speaker,
+                    style_kv_scale, style_trunc,
+                    speaker_kv_scale_raw, truncation_factor_raw,
+                ]
+
+                preset_normal.click(
+                    lambda: _apply_preset("normal"), outputs=_preset_outputs,
+                )
+                preset_strong.click(
+                    lambda: _apply_preset("strong"), outputs=_preset_outputs,
+                )
+                preset_calm.click(
+                    lambda: _apply_preset("calm"), outputs=_preset_outputs,
+                )
+                preset_bright.click(
+                    lambda: _apply_preset("bright"), outputs=_preset_outputs,
+                )
+                preset_whisper.click(
+                    lambda: _apply_preset("whisper"), outputs=_preset_outputs,
+                )
+
+                # スタイルスライダー変更 → CFGスライダーと内部テキストへ反映
+                def _sync_style_to_cfg(ct, cs, kv, tr):
+                    kv_str = "" if kv <= 1.0 else str(round(kv, 2))
+                    tr_str = "" if tr >= 1.0 else str(round(tr, 2))
+                    return ct, cs, kv_str, tr_str
+
+                style_cfg_text.change(
+                    lambda v, cs, kv, tr: _sync_style_to_cfg(v, cs, kv, tr),
+                    inputs=[style_cfg_text, style_cfg_speaker, style_kv_scale, style_trunc],
+                    outputs=[cfg_scale_text, cfg_scale_speaker, speaker_kv_scale_raw, truncation_factor_raw],
+                )
+                style_cfg_speaker.change(
+                    lambda ct, v, kv, tr: _sync_style_to_cfg(ct, v, kv, tr),
+                    inputs=[style_cfg_text, style_cfg_speaker, style_kv_scale, style_trunc],
+                    outputs=[cfg_scale_text, cfg_scale_speaker, speaker_kv_scale_raw, truncation_factor_raw],
+                )
+                style_kv_scale.change(
+                    lambda ct, cs, v, tr: _sync_style_to_cfg(ct, cs, v, tr),
+                    inputs=[style_cfg_text, style_cfg_speaker, style_kv_scale, style_trunc],
+                    outputs=[cfg_scale_text, cfg_scale_speaker, speaker_kv_scale_raw, truncation_factor_raw],
+                )
+                style_trunc.change(
+                    lambda ct, cs, kv, v: _sync_style_to_cfg(ct, cs, kv, v),
+                    inputs=[style_cfg_text, style_cfg_speaker, style_kv_scale, style_trunc],
+                    outputs=[cfg_scale_text, cfg_scale_speaker, speaker_kv_scale_raw, truncation_factor_raw],
+                )
+
+                # CFGスライダー変更 → スタイルスライダーへ反映（逆同期）
+                cfg_scale_text.change(
+                    lambda v: v, inputs=[cfg_scale_text], outputs=[style_cfg_text],
+                )
+                cfg_scale_speaker.change(
+                    lambda v: v, inputs=[cfg_scale_speaker], outputs=[style_cfg_speaker],
+                )
 
                 hf_dl_btn.click(_download_from_hf, inputs=[hf_repo_id], outputs=[infer_checkpoint, hf_dl_status])
                 infer_refresh_btn.click(
@@ -1719,7 +2095,8 @@ def build_ui() -> gr.Blocks:
                     inputs=[infer_checkpoint, model_device, model_precision, codec_device, codec_precision, enable_watermark, infer_lora_adapter],
                     outputs=[model_status])
                 unload_model_btn.click(_clear_runtime_cache, outputs=[model_status])
-                generate_btn.click(_run_generation,
+                _ui_outputs = _cand_labels + _cand_audios + [out_log, out_timing]
+                generate_btn.click(_run_generation_ui,
                     inputs=[
                         infer_checkpoint, model_device, model_precision, codec_device, codec_precision, enable_watermark,
                         infer_lora_adapter, infer_lora_scale,
@@ -1727,8 +2104,9 @@ def build_ui() -> gr.Blocks:
                         cfg_scale_text, cfg_scale_speaker, cfg_scale_raw, cfg_min_t, cfg_max_t,
                         context_kv_cache, truncation_factor_raw, rescale_k_raw, rescale_sigma_raw,
                         speaker_kv_scale_raw, speaker_kv_min_t_raw, speaker_kv_max_layers_raw,
+                        num_candidates,
                     ],
-                    outputs=[out_audio, out_log, out_timing],
+                    outputs=_ui_outputs,
                 )
 
             # ═══════════════════════════════════════════════════════════════
@@ -3074,6 +3452,8 @@ def main() -> None:
         share=bool(args.share),
         debug=bool(args.debug),
         theme=gr.themes.Soft(),
+        css=_DARK_CSS,
+        js=_DARK_JS,
     )
 
 
