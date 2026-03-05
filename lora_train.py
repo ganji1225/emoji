@@ -648,6 +648,11 @@ def main() -> None:
 
     print(f"学習開始: max_steps={args.max_steps} save_every={args.save_every}")
 
+    import time as _time
+
+    _step_times: list[float] = []   # 直近ステップの完了時刻（最大100件）
+    _MAX_TIME_WINDOW = 100           # 移動平均の窓サイズ
+
     try:
         while step < args.max_steps and not (early_stopper is not None and early_stopper.should_stop):
             epoch += 1
@@ -729,10 +734,35 @@ def main() -> None:
                 if ema_model is not None:
                     ema_model.update(model)
                 step += 1
+                _step_times.append(_time.monotonic())
+                if len(_step_times) > _MAX_TIME_WINDOW + 1:
+                    _step_times.pop(0)
 
-                if step == 1 or step % args.log_every == 0:
+                # 最初の5ステップは強制ログ出力（早期ETA概算のため）
+                if step <= 5 or step % args.log_every == 0:
                     lr_val = current_lr(optimizer)
-                    print(f"step={step} loss={step_loss:.6f} lr={lr_val:.3e}")
+                    # 残り時間推定（2ステップ目から即座に概算を出す）
+                    if len(_step_times) >= 2:
+                        elapsed = _step_times[-1] - _step_times[0]
+                        n_intervals = len(_step_times) - 1
+                        sec_per_step = elapsed / n_intervals
+                        remaining_steps = args.max_steps - step
+                        eta_sec = sec_per_step * remaining_steps
+                        # 〇時間〇分〇秒 形式でフォーマット
+                        def _fmt_eta(s):
+                            s = int(s)
+                            h, rem = divmod(s, 3600)
+                            m, sec = divmod(rem, 60)
+                            if h > 0:
+                                return f"{h}時間{m}分"
+                            elif m > 0:
+                                return f"{m}分{sec}秒"
+                            else:
+                                return f"{sec}秒"
+                        speed_str = f"{1.0/sec_per_step:.3f}steps/s" if sec_per_step > 0 else "?"
+                        print(f"step={step} loss={step_loss:.6f} lr={lr_val:.3e} speed={speed_str} eta={_fmt_eta(eta_sec)}")
+                    else:
+                        print(f"step={step} loss={step_loss:.6f} lr={lr_val:.3e}")
                     if wandb_run is not None:
                         wandb_run.log({"train/loss": step_loss, "train/lr": lr_val}, step=step)
 
@@ -784,6 +814,45 @@ def main() -> None:
     finally:
         if wandb_run is not None:
             wandb_run.finish()
+
+        # DataLoaderワーカーを先にシャットダウン（SIGINTで中断した際のpickleエラー抑制）
+        for _dl in [loader, valid_loader]:
+            if _dl is None:
+                continue
+            try:
+                _dl._iterator = None  # イテレータを解放
+            except Exception:
+                pass
+            try:
+                if hasattr(_dl, "_workers") and _dl._workers:
+                    for _w in _dl._workers:
+                        try:
+                            _w.terminate()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        # VRAMアンロード（学習終了・中断いずれの場合も実行）
+        print("モデルをVRAMからアンロード中...")
+        try:
+            model.cpu()
+        except Exception:
+            pass
+        if ema_model is not None:
+            try:
+                # EMAのshadow重みもCPU上に残るだけなのでclearして解放
+                ema_model.shadow.clear()
+                ema_model.backup.clear()
+            except Exception:
+                pass
+        del model
+        if ema_model is not None:
+            del ema_model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        print("VRAMアンロード完了")
 
 
 if __name__ == "__main__":

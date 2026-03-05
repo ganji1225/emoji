@@ -10,6 +10,7 @@ import re
 import sys
 from contextlib import nullcontext
 from dataclasses import asdict, replace
+import time as _time
 from pathlib import Path
 
 import torch
@@ -1521,6 +1522,21 @@ def main() -> None:
     accum_steps = int(train_cfg.gradient_accumulation_steps)
     global_batch_size = train_cfg.batch_size * world_size * accum_steps
 
+    # ETA推定用
+    _step_times: list[float] = []
+    _ETA_WINDOW = 100
+
+    def _fmt_eta(s: float) -> str:
+        s = int(s)
+        h, rem = divmod(s, 3600)
+        m, sec = divmod(rem, 60)
+        if h > 0:
+            return f"{h}時間{m}分"
+        elif m > 0:
+            return f"{m}分{sec}秒"
+        else:
+            return f"{sec}秒"
+
     try:
         model.train()
         if scheduler is not None and step == 0:
@@ -1630,10 +1646,13 @@ def main() -> None:
                 if ema_model is not None:
                     ema_model.update(raw_model)
                 step += 1
+                _step_times.append(_time.monotonic())
+                if len(_step_times) > _ETA_WINDOW + 1:
+                    _step_times.pop(0)
                 progress.update(step)
 
-                # step=1またはlog_every毎にlossをターミナルに出力
-                if step == 1 or step % train_cfg.log_every == 0:
+                # 最初の5ステップは強制ログ出力（早期ETA概算のため）
+                if step <= 5 or step % train_cfg.log_every == 0:
                     loss_value = reduce_mean(step_loss, world_size, distributed).item()
                     rf_loss_value = reduce_mean(step_rf_loss, world_size, distributed).item()
                     lr_value = current_lr(optimizer)
@@ -1651,9 +1670,21 @@ def main() -> None:
                         global_batch_size=global_batch_size,
                     )
                     if is_main_process:
-                        progress.write(
-                            f"step={step} loss={loss_value:.6f} rf={rf_loss_value:.6f} lr={lr_value:.3e}"
-                        )
+                        # ETA計算
+                        if len(_step_times) >= 2:
+                            _elapsed = _step_times[-1] - _step_times[0]
+                            _sps = _elapsed / (len(_step_times) - 1)
+                            _remaining = max(0, train_cfg.max_steps - step)
+                            _eta_str = _fmt_eta(_sps * _remaining)
+                            _speed_str = f"{1.0/_sps:.3f}steps/s" if _sps > 0 else "?"
+                            progress.write(
+                                f"step={step} loss={loss_value:.6f} rf={rf_loss_value:.6f} lr={lr_value:.3e}"
+                                f" speed={_speed_str} eta={_eta_str}"
+                            )
+                        else:
+                            progress.write(
+                                f"step={step} loss={loss_value:.6f} rf={rf_loss_value:.6f} lr={lr_value:.3e}"
+                            )
                         if wandb_run is not None:
                             metrics = {
                                 "train/loss": loss_value,
@@ -1834,6 +1865,52 @@ def main() -> None:
             progress.close()
         if wandb_run is not None:
             wandb_run.finish()
+
+        # DataLoaderワーカーを先にシャットダウン（SIGINT中断時のpickleエラー抑制）
+        for _dl in [loader, valid_loader]:
+            if _dl is None:
+                continue
+            try:
+                _dl._iterator = None
+            except Exception:
+                pass
+            try:
+                if hasattr(_dl, "_workers") and _dl._workers:
+                    for _w in _dl._workers:
+                        try:
+                            _w.terminate()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        # VRAMアンロード（main processのみ）
+        if is_main_process:
+            print("モデルをVRAMからアンロード中...")
+            try:
+                raw_model.cpu()
+            except Exception:
+                pass
+            if ema_model is not None:
+                try:
+                    ema_model.shadow.clear()
+                    ema_model.backup.clear()
+                except Exception:
+                    pass
+            try:
+                del raw_model
+            except Exception:
+                pass
+            if ema_model is not None:
+                try:
+                    del ema_model
+                except Exception:
+                    pass
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            print("VRAMアンロード完了")
+
         if distributed and dist.is_initialized():
             dist.destroy_process_group()
 
