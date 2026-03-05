@@ -661,10 +661,14 @@ def _stop_process() -> str:
 _TRAIN_LOG_PATH: Path | None = None
 _TRAIN_PROC: subprocess.Popen | None = None
 _TRAIN_LOG_LOCK = threading.Lock()
+# ETA推定用: {"speed": steps/sec, "eta_sec": float, "step": int, "max_steps": int}
+_TRAIN_ETA_INFO: dict = {}
 
 _LORA_TRAIN_PROC: subprocess.Popen | None = None
 _LORA_TRAIN_LOG_PATH: Path | None = None
 _LORA_TRAIN_LOG_LOCK = threading.Lock()
+# ETA推定用: {"speed": steps/sec, "eta_sec": float, "step": int, "max_steps": int}
+_LORA_ETA_INFO: dict = {}
 
 
 def _load_yaml_config(config_path: str) -> dict:
@@ -791,7 +795,7 @@ def _start_train(
     attention_backend="sdpa",
     *ui_cfg_args,
 ) -> tuple[str, str]:
-    global _TRAIN_LOG_PATH, _TRAIN_PROC
+    global _TRAIN_LOG_PATH, _TRAIN_PROC, _TRAIN_ETA_INFO
 
     with _TRAIN_LOG_LOCK:
         if _TRAIN_PROC is not None and _TRAIN_PROC.poll() is None:
@@ -818,6 +822,8 @@ def _start_train(
     stamp    = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = LOGS_DIR / f"train_{stamp}.log"
 
+    _TRAIN_ETA_INFO.clear()
+
     with _TRAIN_LOG_LOCK:
         _TRAIN_LOG_PATH = log_path
         env = os.environ.copy()
@@ -829,11 +835,45 @@ def _start_train(
         )
         _TRAIN_PROC = proc
 
+    import re as _re_train_eta
+    _TRAIN_STEP_RE = _re_train_eta.compile(r"step=(\d+)")
+    _TRAIN_SPEED_RE = _re_train_eta.compile(r"speed=([0-9.]+)steps/s")
+    _TRAIN_ETA_RE = _re_train_eta.compile(r"eta=(.+)")
+
+    def _train_eta_str_to_sec(eta_str: str) -> float:
+        import re as _r
+        s = eta_str.strip()
+        total = 0.0
+        m = _r.search(r"(\d+)時間", s)
+        if m:
+            total += int(m.group(1)) * 3600
+        m = _r.search(r"(\d+)分", s)
+        if m:
+            total += int(m.group(1)) * 60
+        m = _r.search(r"(\d+)秒", s)
+        if m:
+            total += int(m.group(1))
+        return total
+
     def _stream():
         with open(log_path, "w", encoding="utf-8") as f:
             for line in proc.stdout:
                 f.write(line)
                 f.flush()
+                # train.py のログ行から speed= / eta= を直接パース
+                if "step=" in line and "loss=" in line:
+                    m_step = _TRAIN_STEP_RE.search(line)
+                    m_speed = _TRAIN_SPEED_RE.search(line)
+                    m_eta = _TRAIN_ETA_RE.search(line)
+                    if m_step:
+                        current_step = int(m_step.group(1))
+                        speed = float(m_speed.group(1)) if m_speed else 0.0
+                        eta_sec = _train_eta_str_to_sec(m_eta.group(1)) if m_eta else 0.0
+                        _TRAIN_ETA_INFO.update({
+                            "step": current_step,
+                            "speed": speed,
+                            "eta_sec": eta_sec,
+                        })
         proc.wait()
         _write_tensorboard_events(log_path)
 
@@ -843,11 +883,28 @@ def _start_train(
 
 def _stop_train() -> str:
     global _TRAIN_PROC
+    import signal as _signal
     with _TRAIN_LOG_LOCK:
         if _TRAIN_PROC is None or _TRAIN_PROC.poll() is not None:
             return "実行中の学習プロセスはありません。"
-        _TRAIN_PROC.terminate()
-        return f"学習プロセス (PID {_TRAIN_PROC.pid}) に停止シグナルを送信しました。"
+        pid = _TRAIN_PROC.pid
+        proc = _TRAIN_PROC
+    try:
+        import os as _os
+        _os.kill(pid, _signal.SIGINT)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    def _deferred_kill():
+        import time as _t
+        _t.sleep(5)
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    import threading as _thr
+    _thr.Thread(target=_deferred_kill, daemon=True).start()
+    return f"学習プロセス (PID {pid}) に停止シグナルを送信しました（最大5秒でシャットダウン）。"
 
 
 def _read_train_log() -> str:
@@ -863,6 +920,24 @@ def _read_train_log() -> str:
     lines = text.splitlines()
     if len(lines) > 200:
         text = f"... （先頭省略、末尾200行表示）\n" + "\n".join(lines[-200:])
+    # ETA情報を末尾に付加（学習中のみ）
+    eta = _TRAIN_ETA_INFO
+    if eta and proc is not None and proc.poll() is None:
+        step = eta.get("step", 0)
+        speed = eta.get("speed", 0.0)
+        eta_sec = int(eta.get("eta_sec", 0.0))
+        h, rem = divmod(eta_sec, 3600)
+        m, s = divmod(rem, 60)
+        if h > 0:
+            eta_str = f"{h}時間{m}分"
+        elif m > 0:
+            eta_str = f"{m}分{s}秒"
+        else:
+            eta_str = f"{s}秒"
+        text += (
+            f"\n\n--- ETA: 残り約 {eta_str}"
+            f"  (step={step}, {speed:.3f} steps/sec) ---"
+        )
     return text
 
 
@@ -874,17 +949,31 @@ def _parse_train_log_metrics():
     if path is None or not path.exists():
         return pd.DataFrame({"step": [], "loss": [], "lr": []})
 
+    import re as _re_metrics
+    # 各フィールドを個別に正規表現で抽出（speed= や eta= が混在しても壊れない）
+    _RE_STEP = _re_metrics.compile(r"\bstep=(\d+)")
+    _RE_LOSS = _re_metrics.compile(r"\bloss=([0-9.eE+\-]+)")
+    _RE_LR   = _re_metrics.compile(r"\blr=([0-9.eE+\-]+)")
+
     rows = []
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         if "step=" not in line or "loss=" not in line:
             continue
+        # valid行・EarlyStopping行などのメトリクス以外の行を除外
+        stripped = line.lstrip()
+        if stripped.startswith("valid") or stripped.startswith("EarlyStopping"):
+            continue
         try:
-            parts = {k: v for k, v in (p.split("=") for p in line.split() if "=" in p)}
-            step = int(parts["step"])
-            loss = float(parts["loss"])
-            lr   = float(parts.get("lr", 0.0))
+            m_step = _RE_STEP.search(line)
+            m_loss = _RE_LOSS.search(line)
+            m_lr   = _RE_LR.search(line)
+            if not m_step or not m_loss:
+                continue
+            step = int(m_step.group(1))
+            loss = float(m_loss.group(1))
+            lr   = float(m_lr.group(1)) if m_lr else 0.0
             rows.append({"step": step, "loss": loss, "lr": lr})
-        except (ValueError, KeyError):
+        except (ValueError, AttributeError):
             continue
     if not rows:
         return pd.DataFrame({"step": [], "loss": [], "lr": []})
@@ -1323,7 +1412,7 @@ def _build_lora_train_command(
 
 
 def _start_lora_train(*args) -> tuple[str, str]:
-    global _LORA_TRAIN_PROC, _LORA_TRAIN_LOG_PATH
+    global _LORA_TRAIN_PROC, _LORA_TRAIN_LOG_PATH, _LORA_ETA_INFO
 
     with _LORA_TRAIN_LOG_LOCK:
         if _LORA_TRAIN_PROC is not None and _LORA_TRAIN_PROC.poll() is None:
@@ -1332,9 +1421,22 @@ def _start_lora_train(*args) -> tuple[str, str]:
     cmd_list = _build_lora_train_command(*args)
     cmd_str = " ".join(cmd_list)
 
+    # _build_lora_train_command のシグネチャ順 (0-indexed):
+    # 0:base_model 1:manifest 2:output_dir 3:run_name 4:lora_rank 5:lora_alpha
+    # 6:lora_dropout 7:target_modules 8:save_mode 9:attention_backend
+    # 10:use_early_stopping 11:es_patience 12:es_min_delta 13:use_ema 14:ema_decay
+    # 15:resume_enabled 16:resume_lora_path 17:batch_size 18:grad_accum 19:lr
+    # 20:optimizer 21:lr_scheduler 22:warmup_steps 23:max_steps ...
+    try:
+        _max_steps = int(args[23])
+    except (IndexError, ValueError, TypeError):
+        _max_steps = 0
+
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = LOGS_DIR / f"lora_train_{stamp}.log"
+
+    _LORA_ETA_INFO.clear()
 
     with _LORA_TRAIN_LOG_LOCK:
         _LORA_TRAIN_LOG_PATH = log_path
@@ -1348,11 +1450,51 @@ def _start_lora_train(*args) -> tuple[str, str]:
         )
         _LORA_TRAIN_PROC = proc
 
+    import re as _re_eta
+    _STEP_RE = _re_eta.compile(r"step=(\d+)")
+    import re as _re_speed
+    _SPEED_RE = _re_speed.compile(r"speed=([0-9.]+)steps/s")
+    _ETA_STR_RE = _re_speed.compile(r"eta=(.+)")
+
+    def _eta_str_to_sec(eta_str: str) -> float:
+        """lora_train.py が出力する eta= 文字列を秒数に変換する。
+        フォーマット: 〇時間〇分 / 〇分〇秒 / 〇秒
+        """
+        import re as _r
+        s = eta_str.strip()
+        total = 0.0
+        m = _r.search(r"(\d+)時間", s)
+        if m:
+            total += int(m.group(1)) * 3600
+        m = _r.search(r"(\d+)分", s)
+        if m:
+            total += int(m.group(1)) * 60
+        m = _r.search(r"(\d+)秒", s)
+        if m:
+            total += int(m.group(1))
+        return total
+
     def _stream():
         with open(log_path, "w", encoding="utf-8") as f:
             for line in proc.stdout:
                 f.write(line)
                 f.flush()
+                # ステップ行からstep/speed/etaを直接パースして更新
+                # lora_train.py が計算した値をそのまま使うことで二重計算のズレを排除
+                if "step=" in line and "loss=" in line:
+                    m_step = _STEP_RE.search(line)
+                    m_speed = _SPEED_RE.search(line)
+                    m_eta = _ETA_STR_RE.search(line)
+                    if m_step and _max_steps > 0:
+                        current_step = int(m_step.group(1))
+                        speed = float(m_speed.group(1)) if m_speed else 0.0
+                        eta_sec = _eta_str_to_sec(m_eta.group(1)) if m_eta else 0.0
+                        _LORA_ETA_INFO.update({
+                            "step": current_step,
+                            "max_steps": _max_steps,
+                            "speed": speed,
+                            "eta_sec": eta_sec,
+                        })
         proc.wait()
 
     threading.Thread(target=_stream, daemon=True).start()
@@ -1365,11 +1507,30 @@ def _start_lora_train(*args) -> tuple[str, str]:
 
 def _stop_lora_train() -> str:
     global _LORA_TRAIN_PROC
+    import signal as _signal
     with _LORA_TRAIN_LOG_LOCK:
         if _LORA_TRAIN_PROC is None or _LORA_TRAIN_PROC.poll() is not None:
             return "実行中のLoRA学習プロセスはありません。"
-        _LORA_TRAIN_PROC.terminate()
-        return f"LoRA学習プロセス (PID {_LORA_TRAIN_PROC.pid}) に停止シグナルを送信しました。"
+        pid = _LORA_TRAIN_PROC.pid
+        proc = _LORA_TRAIN_PROC
+    # SIGINTでグレースフルシャットダウンを試みる（DataLoaderが正常終了できる）
+    try:
+        import os as _os
+        _os.kill(pid, _signal.SIGINT)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    # 最大5秒待機し、まだ生きていれば強制終了
+    def _deferred_kill():
+        import time as _t
+        _t.sleep(5)
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    import threading as _thr
+    _thr.Thread(target=_deferred_kill, daemon=True).start()
+    return f"LoRA学習プロセス (PID {pid}) に停止シグナルを送信しました（最大5秒でシャットダウン）。"
 
 
 def _read_lora_train_log() -> str:
@@ -1384,6 +1545,27 @@ def _read_lora_train_log() -> str:
     lines = text.splitlines()
     if len(lines) > 200:
         text = "... （先頭省略、末尾200行表示）\n" + "\n".join(lines[-200:])
+    # ETA情報を末尾に付加（学習中のみ）
+    eta = _LORA_ETA_INFO
+    if eta and proc is not None and proc.poll() is None:
+        step = eta.get("step", 0)
+        max_steps = eta.get("max_steps", 0)
+        speed = eta.get("speed", 0.0)
+        eta_sec = int(eta.get("eta_sec", 0.0))
+        h, rem = divmod(eta_sec, 3600)
+        m, s = divmod(rem, 60)
+        if h > 0:
+            eta_str = f"{h}時間{m}分"
+        elif m > 0:
+            eta_str = f"{m}分{s}秒"
+        else:
+            eta_str = f"{s}秒"
+        progress_pct = (step / max_steps * 100) if max_steps > 0 else 0.0
+        text += (
+            f"\n\n--- ETA: 残り約 {eta_str}"
+            f"  ({step}/{max_steps} steps, {progress_pct:.1f}%,"
+            f" {speed:.3f} steps/sec) ---"
+        )
     return text
 
 
