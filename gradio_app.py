@@ -669,6 +669,8 @@ def _run_generation(
     truncation_factor_raw, rescale_k_raw, rescale_sigma_raw,
     speaker_kv_scale_raw, speaker_kv_min_t_raw, speaker_kv_max_layers_raw,
     num_candidates: int = 1,
+    multiline_mode: str = "デフォルト",
+    silence_sec: float = 0.1,
 ) -> tuple[list[tuple[str, str]], str, str]:
     def stdout_log(msg: str) -> None:
         print(msg, flush=True)
@@ -717,7 +719,19 @@ def _run_generation(
     else:
         no_ref = True
 
-    num_candidates = max(1, int(num_candidates))
+    # ── 改行分割モードの判定 ────────────────────────────────────────
+    _multiline_mode = str(multiline_mode).strip()
+    _use_multiline = _multiline_mode in (
+        "改行ごとに連続生成で終了",
+        "改行ごとに連続生成後に連結",
+    )
+    _use_concat = _multiline_mode == "改行ごとに連続生成後に連結"
+
+    # 改行分割モード時は候補数を強制的に1に固定
+    if _use_multiline:
+        num_candidates = 1
+    else:
+        num_candidates = max(1, int(num_candidates))
 
     runtime, reloaded = get_cached_runtime(runtime_key)
     stdout_log(f"[gradio] runtime: {'reloaded' if reloaded else 'reused'}")
@@ -733,21 +747,20 @@ def _run_generation(
     all_detail_lines: list[str] = [
         "runtime: reloaded" if reloaded else "runtime: reused",
         f"model_version: {_ver_str}",
+        f"multiline_mode: {_multiline_mode}",
     ]
     if runtime_key.lora_path:
         all_detail_lines.append(f"lora: {Path(runtime_key.lora_path).name}")
     last_timing_text = ""
 
-    for i in range(num_candidates):
-        candidate_seed = None if seed is None else (seed + i)
-        stdout_log(f"[gradio] generating candidate {i + 1}/{num_candidates} ...")
-
-        result = runtime.synthesize(
+    # ── 共通のsynthesize呼び出しヘルパー ───────────────────────────
+    def _synthesize_line(line_text: str, line_seed) -> object:
+        return runtime.synthesize(
             SamplingRequest(
-                text=str(text), ref_wav=ref_wav, ref_latent=ref_latent_path, no_ref=bool(no_ref),
+                text=str(line_text), ref_wav=ref_wav, ref_latent=ref_latent_path, no_ref=bool(no_ref),
                 seconds=FIXED_SECONDS, max_ref_seconds=30.0, max_text_len=None,
                 num_steps=int(num_steps),
-                seed=candidate_seed,
+                seed=line_seed,
                 cfg_guidance_mode=str(cfg_guidance_mode),
                 cfg_scale_text=float(cfg_scale_text), cfg_scale_speaker=float(cfg_scale_speaker),
                 cfg_scale=cfg_scale, cfg_min_t=float(cfg_min_t), cfg_max_t=float(cfg_max_t),
@@ -761,23 +774,105 @@ def _run_generation(
             log_fn=stdout_log,
         )
 
-        stamp    = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        out_path = save_wav(
-            OUTPUTS_DIR / f"sample_{stamp}_c{i + 1}.wav",
-            result.audio.float(),
-            result.sample_rate,
-        )
-        caption = f"候補 {i + 1}  seed={result.used_seed}"
-        gallery_items.append((str(out_path), caption))
+    # ── 改行分割モード ──────────────────────────────────────────────
+    if _use_multiline:
+        import torch as _torch
 
-        all_detail_lines.append(
-            f"[候補 {i + 1}] seed={result.used_seed}  saved={out_path}"
-        )
-        for msg in result.messages:
-            all_detail_lines.append(f"  {msg}")
+        lines = [ln for ln in str(text).split("\n") if ln.strip()]
+        if not lines:
+            raise ValueError("有効なテキスト行がありません。")
 
-        last_timing_text = _format_timings(result.stage_timings, result.total_to_decode)
-        stdout_log(f"[gradio] candidate {i + 1} saved: {out_path}")
+        all_detail_lines.append(f"分割行数: {len(lines)}")
+        if _use_concat:
+            all_detail_lines.append(f"無音区間: {silence_sec:.1f}秒")
+
+        line_results = []
+        for li, line in enumerate(lines):
+            line_seed = None if seed is None else (seed + li)
+            stdout_log(f"[gradio] generating line {li + 1}/{len(lines)}: {line[:40]!r} ...")
+            result = _synthesize_line(line, line_seed)
+            line_results.append(result)
+            all_detail_lines.append(
+                f"[行 {li + 1}] seed={result.used_seed}  text={line[:40]!r}"
+            )
+            for msg in result.messages:
+                all_detail_lines.append(f"  {msg}")
+            last_timing_text = _format_timings(result.stage_timings, result.total_to_decode)
+
+        if _use_concat:
+            # ── 連結モード: 無音区間を挟んで1ファイルに結合 ──────────
+            sample_rate = line_results[0].sample_rate
+            silence_samples = int(silence_sec * sample_rate)
+
+            audio_segments = []
+            for li, result in enumerate(line_results):
+                audio_segments.append(result.audio.float())
+                if li < len(line_results) - 1 and silence_samples > 0:
+                    silence_tensor = _torch.zeros(
+                        result.audio.shape[0] if result.audio.dim() > 1 else 1,
+                        silence_samples,
+                        dtype=_torch.float32,
+                    ) if result.audio.dim() > 1 else _torch.zeros(
+                        silence_samples,
+                        dtype=_torch.float32,
+                    )
+                    audio_segments.append(silence_tensor)
+
+            if line_results[0].audio.dim() > 1:
+                concatenated = _torch.cat(audio_segments, dim=-1)
+            else:
+                concatenated = _torch.cat(audio_segments, dim=0)
+
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            out_path = save_wav(
+                OUTPUTS_DIR / f"sample_{stamp}_concat.wav",
+                concatenated,
+                sample_rate,
+            )
+            caption = f"連結音声  {len(lines)}行  無音{silence_sec:.1f}秒"
+            gallery_items.append((str(out_path), caption))
+            all_detail_lines.append(f"連結保存: {out_path}")
+            stdout_log(f"[gradio] concatenated saved: {out_path}")
+
+        else:
+            # ── 個別保存モード: 行ごとに別ファイルとして保存 ──────────
+            stamp_base = datetime.now().strftime("%Y%m%d_%H%M%S")
+            for li, result in enumerate(line_results):
+                out_path = save_wav(
+                    OUTPUTS_DIR / f"sample_{stamp_base}_line{li + 1}.wav",
+                    result.audio.float(),
+                    result.sample_rate,
+                )
+                caption = f"行 {li + 1}  seed={result.used_seed}"
+                gallery_items.append((str(out_path), caption))
+                all_detail_lines.append(f"[行 {li + 1}] saved={out_path}")
+                stdout_log(f"[gradio] line {li + 1} saved: {out_path}")
+
+    # ── 通常モード（デフォルト） ────────────────────────────────────
+    else:
+        for i in range(num_candidates):
+            candidate_seed = None if seed is None else (seed + i)
+            stdout_log(f"[gradio] generating candidate {i + 1}/{num_candidates} ...")
+
+            result = _synthesize_line(str(text), candidate_seed)
+
+            stamp    = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            out_path = save_wav(
+                OUTPUTS_DIR / f"sample_{stamp}_c{i + 1}.wav",
+                result.audio.float(),
+                result.sample_rate,
+            )
+            caption = f"候補 {i + 1}  seed={result.used_seed}"
+            gallery_items.append((str(out_path), caption))
+
+            all_detail_lines.append(
+                f"[候補 {i + 1}] seed={result.used_seed}  saved={out_path}"
+            )
+            for msg in result.messages:
+                all_detail_lines.append(f"  {msg}")
+
+            last_timing_text = _format_timings(result.stage_timings, result.total_to_decode)
+            stdout_log(f"[gradio] candidate {i + 1} saved: {out_path}")
 
     detail_text = "\n".join(all_detail_lines)
     return gallery_items, detail_text, last_timing_text
@@ -2358,11 +2453,47 @@ def build_ui() -> gr.Blocks:
                     truncation_factor_raw = gr.Textbox(visible=False, value="")
                     speaker_kv_scale_raw  = gr.Textbox(visible=False, value="")
 
+                # ── 改行分割生成オプション ───────────────────────────────
+                with gr.Accordion("📝 改行分割生成オプション", open=True):
+                    gr.Markdown(
+                        "プロンプトの改行ごとに生成を区切り、連続生成・連結するオプションです。\n"
+                        "- **デフォルト**: テキスト全体を1回で生成します（従来の動作）\n"
+                        "- **改行ごとに連続生成で終了**: 改行ごとに個別ファイルをギャラリーに出力します\n"
+                        "- **改行ごとに連続生成後に連結**: 改行ごとに生成後、無音区間を挟んで1ファイルに連結します\n\n"
+                        "> 改行分割モード選択時は「生成候補数」が自動的に1に固定されます。"
+                    )
+                    multiline_mode = gr.Dropdown(
+                        label="改行分割生成モード",
+                        choices=[
+                            "デフォルト",
+                            "改行ごとに連続生成で終了",
+                            "改行ごとに連続生成後に連結",
+                        ],
+                        value="デフォルト",
+                        info="デフォルト=通常生成 / 連続生成=行ごとに個別出力 / 連結=無音区間を挟んで1ファイルに結合",
+                    )
+                    silence_sec = gr.Slider(
+                        label="無音区間（秒）",
+                        minimum=0.1, maximum=3.0, value=0.1, step=0.1,
+                        interactive=False,
+                        info="連結モード時に行間に挿入する無音の長さ（連結モード以外では無効）",
+                    )
+
+                    def _on_multiline_mode_change(mode: str):
+                        is_concat = mode == "改行ごとに連続生成後に連結"
+                        return gr.Slider(interactive=is_concat)
+
+                    multiline_mode.change(
+                        _on_multiline_mode_change,
+                        inputs=[multiline_mode],
+                        outputs=[silence_sec],
+                    )
+
                 # ── 候補数設定 ──────────────────────────────────────────
                 num_candidates = gr.Slider(
                     label="生成候補数 (Num Candidates)",
                     minimum=1, maximum=8, value=1, step=1,
-                    info="1回の生成で作成する候補音声の数。シード指定時は seed, seed+1, seed+2... が使われます。",
+                    info="1回の生成で作成する候補音声の数。シード指定時は seed, seed+1, seed+2... が使われます。改行分割モード時は1固定。",
                 )
 
                 # ── テキスト入力（生成ボタン直上） ─────────────────────
@@ -2560,6 +2691,8 @@ def build_ui() -> gr.Blocks:
                         context_kv_cache, truncation_factor_raw, rescale_k_raw, rescale_sigma_raw,
                         speaker_kv_scale_raw, speaker_kv_min_t_raw, speaker_kv_max_layers_raw,
                         num_candidates,
+                        multiline_mode,
+                        silence_sec,
                     ],
                     outputs=_ui_outputs,
                 )
