@@ -15,7 +15,7 @@ import random
 import re
 import sys
 from contextlib import nullcontext
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -241,8 +241,13 @@ def _load_base_model(base_model_path: str, device: torch.device) -> tuple[TextTo
         )
 
     # inference config keys を除外してモデル設定を取得
-    _INF_KEYS = {"max_text_len", "fixed_target_latent_steps"}
-    model_cfg_dict = {k: v for k, v in checkpoint_model_cfg.items() if k not in _INF_KEYS}
+    _INF_KEYS = {"max_text_len", "fixed_target_latent_steps", "max_caption_len"}
+    # ModelConfig が受け付けるフィールドのみに絞る（VoiceDesignモデルの不整合対策）
+    valid_model_keys = {f.name for f in fields(ModelConfig)}
+    model_cfg_dict = {
+        k: v for k, v in checkpoint_model_cfg.items()
+        if k not in _INF_KEYS and k in valid_model_keys
+    }
     model_cfg = ModelConfig(**model_cfg_dict)
 
     model = TextToLatentRFDiT(model_cfg).to(device)
@@ -437,11 +442,15 @@ def main() -> None:
     tokenizer = build_text_tokenizer(model_cfg, local_files_only=False)
 
     # ── データセット ────────────────────────────────────────────────
+    # VoiceDesignモデルは caption-driven、speakerは無効
+    enable_caption = bool(getattr(model_cfg, "use_caption_condition", False))
+    enable_speaker = not enable_caption
     full_dataset = LatentTextDataset(
         manifest_path=args.manifest,
         latent_dim=model_cfg.latent_dim,
-        latent_patch_size=model_cfg.latent_patch_size,
         max_latent_steps=args.max_latent_steps,
+        enable_caption_condition=enable_caption,
+        enable_speaker_condition=enable_speaker,
     )
 
     train_dataset = full_dataset
@@ -455,21 +464,34 @@ def main() -> None:
         train_dataset = LatentTextDataset(
             manifest_path=args.manifest,
             latent_dim=model_cfg.latent_dim,
-            latent_patch_size=model_cfg.latent_patch_size,
             max_latent_steps=args.max_latent_steps,
             subset_indices=train_indices,
+            enable_caption_condition=enable_caption,
+            enable_speaker_condition=enable_speaker,
         )
         valid_dataset = LatentTextDataset(
             manifest_path=args.manifest,
             latent_dim=model_cfg.latent_dim,
-            latent_patch_size=model_cfg.latent_patch_size,
             max_latent_steps=args.max_latent_steps,
             subset_indices=valid_indices,
+            enable_caption_condition=enable_caption,
+            enable_speaker_condition=enable_speaker,
         )
         print(f"バリデーション分割: train={len(train_dataset)} valid={len(valid_dataset)}")
 
+    # Caption tokenizer（VoiceDesignモデル用）
+    caption_tokenizer = None
+    if enable_caption:
+        caption_tokenizer = PretrainedTextTokenizer.from_pretrained(
+            repo_id=model_cfg.caption_tokenizer_repo_resolved,
+            add_bos=bool(model_cfg.caption_add_bos_resolved),
+            local_files_only=False,
+            cache_dir=str(_HF_TOKENIZER_CACHE_DIR),
+        )
+
     collator = TTSCollator(
         tokenizer=tokenizer,
+        caption_tokenizer=caption_tokenizer,
         latent_dim=model_cfg.latent_dim,
         latent_patch_size=model_cfg.latent_patch_size,
         fixed_target_latent_steps=args.fixed_target_latent_steps,
@@ -666,6 +688,12 @@ def main() -> None:
                 ref_latent = batch["ref_latent_patched"].to(device, non_blocking=True)
                 ref_mask = batch["ref_latent_mask_patched"].to(device, non_blocking=True)
                 has_speaker = batch["has_speaker"].to(device, non_blocking=True)
+                # caption（VoiceDesignモデル用）
+                caption_ids = None
+                caption_mask = None
+                if enable_caption and "caption_ids" in batch:
+                    caption_ids = batch["caption_ids"].to(device, non_blocking=True)
+                    caption_mask = batch["caption_mask"].to(device, non_blocking=True)
 
                 bsz = x0.shape[0]
                 if args.timestep_stratified:
@@ -701,12 +729,21 @@ def main() -> None:
                     torch.autocast(device_type="cuda", dtype=torch.bfloat16)
                     if use_bf16 else nullcontext()
                 ):
-                    v_pred = model(
+                    model_kwargs = dict(
                         x_t=x_t, t=t,
                         text_input_ids=text_ids, text_mask=text_mask,
                         ref_latent=ref_latent, ref_mask=ref_mask,
                         latent_mask=x_mask,
                     )
+                    if caption_ids is not None:
+                        # caption-driven (VoiceDesign): caption ドロップアウト適用
+                        cap_drop = torch.rand(bsz, device=device) < args.text_condition_dropout
+                        cm = caption_mask.clone()
+                        if cap_drop.any():
+                            cm[cap_drop] = False
+                        model_kwargs["caption_input_ids"] = caption_ids
+                        model_kwargs["caption_mask"] = cm
+                    v_pred = model(**model_kwargs)
 
                 v_pred = v_pred.float()
                 loss = echo_style_masked_mse(

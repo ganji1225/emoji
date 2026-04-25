@@ -52,3 +52,26 @@ logs/tensorboard/
 checkpoints/tokenizers/
 checkpoints/whisper/
 torch_hub/
+
+# === 個人バックアップ用 設定（ganji1225/emoji 向け） ===
+# 通常はモデル・音声を ignore しているが、個人 LoRA やデータセットは保持する
+!lora/voice_*_v1/
+!lora/voice_*_v1/**
+!data/*_v1/
+!data/*_v1/**
+!input/
+!input/**
+
+# 個人バックアップ対象から除外（テスト出力・バックアップファイル等）
+outputs/cfg_comparison/
+outputs/emoji_test_voicedesign/
+outputs/emoji_test_v1/
+outputs/konomi_test/
+outputs/ganyu_test/
+outputs/post_pull_test*
+*.bak_*
+*.bak
+data/*/slices_td_tmp/
+
+# checkpoints は再DL可能なので除外
+checkpoints/
