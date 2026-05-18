@@ -55,13 +55,21 @@ checkpoints/whisper/
 torch_hub/
 
 # === 個人バックアップ用 設定（ganji1225/emoji 向け） ===
-# 通常はモデル・音声を ignore しているが、個人 LoRA やデータセットは保持する
-!lora/voice_*_v1/
-!lora/voice_*_v1/**
-!data/*_v1/
-!data/*_v1/**
+# LoRA・データフォルダの設定ファイル（JSON等）はバックアップ対象
+# バイナリモデル（.safetensors, .pt, .pth）は容量大のため除外
+!lora/
+!lora/**/
+!data/
+!data/**/
 !input/
 !input/**
+# バイナリは再度除外
+lora/**/*.safetensors
+lora/**/*.pt
+lora/**/*.pth
+data/**/*.pt
+data/**/*.pth
+data/**/*.safetensors
 
 # 個人バックアップ対象から除外（テスト出力・バックアップファイル等）
 outputs/cfg_comparison/
