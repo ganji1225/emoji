@@ -223,8 +223,15 @@ def _run_create_speaker(
     codec = _cached_runtime.codec
 
     # モデルバージョン情報を取得してログに含める
+    # 注意: v2 と v3 はどちらも latent_dim=32 なので use_duration_predictor で区別する
     ldim = int(_cached_runtime.model_cfg.latent_dim)
-    version_label = "v2" if ldim == 32 else ("v1" if ldim == 128 else f"unknown(dim={ldim})")
+    udp = bool(getattr(_cached_runtime.model_cfg, "use_duration_predictor", False))
+    if ldim == 32:
+        version_label = "v3" if udp else "v2"
+    elif ldim == 128:
+        version_label = "v1"
+    else:
+        version_label = f"unknown(dim={ldim})"
 
     try:
         wav, sr = torchaudio.load(wav_path)
@@ -421,13 +428,21 @@ def _save_lora_preset(name: str, *cfg_args):
 
 def _detect_model_version_from_runtime() -> tuple[str, str, int] | None:
     """キャッシュ済み runtime からモデルバージョン情報を取得する。
+
+    v2 と v3 はどちらも latent_dim=32 なので、use_duration_predictor で区別する。
     戻り値: (version_label, codec_repo, latent_dim) または None"""
     from irodori_tts.inference_runtime import _RUNTIME_CACHE_VALUE
     runtime = _RUNTIME_CACHE_VALUE
     if runtime is None:
         return None
     ldim = int(runtime.model_cfg.latent_dim)
-    version = "v2" if ldim == 32 else ("v1" if ldim == 128 else f"unknown(dim={ldim})")
+    udp = bool(getattr(runtime.model_cfg, "use_duration_predictor", False))
+    if ldim == 32:
+        version = "v3" if udp else "v2"
+    elif ldim == 128:
+        version = "v1"
+    else:
+        version = f"unknown(dim={ldim})"
     return version, runtime.key.codec_repo, ldim
 
 

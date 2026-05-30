@@ -55,14 +55,15 @@ checkpoints/whisper/
 torch_hub/
 
 # === 個人バックアップ用 設定（ganji1225/emoji 向け） ===
-# LoRA・データフォルダの設定ファイル（JSON等）はバックアップ対象
-# バイナリモデル（.safetensors, .pt, .pth）は容量大のため除外
+# LoRA フォルダのバイナリ以外（adapter_config.json 等）はバックアップ対象
+# data/ 配下の manifest_v3.jsonl 等もバックアップ対象
+# input/ は外部ストレージ管理（Dropbox 等）でローカル/Git からは除外
 !lora/
 !lora/**/
 !data/
 !data/**/
-!input/
-!input/**
+# input/ は完全除外（容量大・外部退避済み）
+input/
 # バイナリは再度除外
 lora/**/*.safetensors
 lora/**/*.pt

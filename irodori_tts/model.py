@@ -964,14 +964,16 @@ class DurationPredictor(nn.Module):
 
     def forward(
         self,
-        *,
         text_state: torch.Tensor,
+        *,
         text_mask: torch.Tensor,
         aux_features: torch.Tensor,
         speaker_state: torch.Tensor | None = None,
         speaker_mask: torch.Tensor | None = None,
         has_speaker: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # PEFT ModulesToSaveWrapper 互換のため text_state を位置引数化
+        # （wrapper.forward(self, x, *args, **kwargs) → x が必須位置引数）
         if text_state.ndim != 3 or text_state.shape[-1] != self.text_dim:
             raise ValueError(
                 f"text_state must have shape (B, S, {self.text_dim}), "
@@ -1469,8 +1471,10 @@ class TextToLatentRFDiT(nn.Module):
                 f"expected {self.cfg.duration_aux_dim}, got {duration_features.shape[1]}"
             )
 
+        # PEFT ModulesToSaveWrapper 互換のため第1引数は位置渡し
+        # （wrapper.forward(self, x, *args, **kwargs) → x が必須位置引数）
         pred = self.duration_predictor(
-            text_state=text_state.detach(),
+            text_state.detach(),
             text_mask=text_mask,
             aux_features=duration_features,
             speaker_state=None if speaker_state is None else speaker_state.detach(),
