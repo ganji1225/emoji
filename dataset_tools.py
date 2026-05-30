@@ -353,6 +353,25 @@ def slice_audio(
     """
     import torch
     import torchaudio
+    import soundfile as _sf
+    import numpy as _np
+
+    def _sf_load(path: str):
+        """soundfile を使って音声を読み込み torchaudio.load 互換の (C,T) tensor を返す。
+
+        torchaudio 2.11 系は torchcodec/FFmpeg 共有DLLが必要で Windows static build
+        では失敗するため、soundfile による直接読み込みにフォールバックする。
+        """
+        data, sr = _sf.read(path, dtype="float32", always_2d=True)  # (T, C)
+        tensor = torch.from_numpy(data.T.copy())  # (C, T)
+        return tensor, sr
+
+    def _sf_save(path: str, tensor: torch.Tensor, sr: int):
+        """soundfile を使って WAV を保存する。tensor shape: (C, T)"""
+        arr = tensor.cpu().numpy().T  # (T, C)
+        if arr.shape[1] == 1:
+            arr = arr[:, 0]  # mono
+        _sf.write(path, arr, sr, subtype="PCM_16")
 
     SILERO_SR = 16000  # Silero VAD の動作サンプリングレート
 
@@ -375,7 +394,7 @@ def slice_audio(
     for file_idx, audio_path in enumerate(audio_files, 1):
         log_fn(f"[{file_idx}/{total_files}] スライス処理: {audio_path.name}")
         try:
-            wav, orig_sr = torchaudio.load(str(audio_path))
+            wav, orig_sr = _sf_load(str(audio_path))
         except Exception as e:
             log_fn(f"  [ERROR] 読み込み失敗: {e}")
             continue
@@ -443,7 +462,7 @@ def slice_audio(
             if resampler_out is not None:
                 segment = resampler_out(segment)
             out_path = output_dir / f"{stem}_{seg_idx:05d}.wav"
-            torchaudio.save(str(out_path), segment.cpu(), out_sr)
+            _sf_save(str(out_path), segment, out_sr)
             saved.append(out_path)
 
     log_fn(f"\nスライス完了: {len(saved)} ファイル → {output_dir}")
