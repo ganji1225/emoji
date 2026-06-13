@@ -1993,9 +1993,8 @@ def _build_lora_train_command(
             "--early-stopping-min-delta", str(float(es_min_delta)),
         ]
 
-    # ローカルメトリクスログ（wandb_enabled を流用）
-    if wandb_enabled:
-        cmd += ["--metrics-log-dir", str(LOGS_DIR)]
+    # ローカルメトリクスログ（常に LOGS_DIR へ出力）
+    cmd += ["--metrics-log-dir", str(LOGS_DIR)]
 
     if resume_enabled and str(resume_lora_path).strip():
         cmd += ["--resume-lora", str(resume_lora_path).strip()]
@@ -3027,11 +3026,11 @@ def build_ui() -> gr.Blocks:
                 with gr.Row():
                     pm_output_manifest = gr.Textbox(
                         label="出力マニフェストパス（.jsonl）",
-                        value=str(BASE_DIR / "data" / "train_manifest.jsonl"),
+                        value=str(BASE_DIR / "my_manifest" / "train_manifest.jsonl"),
                     )
                     pm_latent_dir = gr.Textbox(
                         label="ラテント保存フォルダ",
-                        value=str(BASE_DIR / "data" / "latents"),
+                        value=str(BASE_DIR / "my_manifest" / "latents"),
                     )
                     pm_device = gr.Dropdown(
                         label="使用デバイス", choices=device_choices, value=default_model_device,
@@ -4941,4 +4940,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     main()
