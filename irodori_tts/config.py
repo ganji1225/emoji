@@ -22,6 +22,9 @@ class ModelConfig:
     text_layers: int = 14
     text_heads: int = 10
     use_caption_condition: bool = False
+    # None = 自動判定（プロパティ use_speaker_condition_resolved で解決）。
+    # 600M VoiceDesign 等の新チェックポイントは明示的に True/False を保存する。
+    use_speaker_condition_field: bool | None = None
     caption_vocab_size: int | None = None
     caption_tokenizer_repo: str | None = None
     caption_add_bos: bool | None = None
@@ -45,6 +48,9 @@ class ModelConfig:
     duration_architecture: str = "token_sum_adarn_zero_no_aux"
     duration_token_init_frames: float = 9.0
     duration_speaker_fusion: str = "adarn_zero"
+    # 600M VoiceDesign で追加されたキャプション由来 duration 制御
+    duration_caption_fusion: str | None = None
+    duration_caption_pooling: str | None = None
 
     @property
     def patched_latent_dim(self) -> int:
@@ -56,8 +62,11 @@ class ModelConfig:
 
     @property
     def use_speaker_condition(self) -> bool:
-        # Voice-design checkpoints are caption-driven and intentionally omit
-        # reference-speaker conditioning to avoid the easier shortcut.
+        # 600M VoiceDesign 等は use_speaker_condition を明示保存する
+        # （caption と speaker を同時に使う設計）。明示値があればそれを優先。
+        if self.use_speaker_condition_field is not None:
+            return bool(self.use_speaker_condition_field)
+        # 旧チェックポイント: caption 駆動なら speaker 条件付けを省略する従来動作。
         return not bool(self.use_caption_condition)
 
     @property

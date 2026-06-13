@@ -218,6 +218,18 @@ def main() -> None:
     )
     parser.add_argument("--num-steps", type=int, default=40)
     parser.add_argument(
+        "--t-schedule-mode",
+        choices=["linear", "sway"],
+        default="linear",
+        help="タイムステップスケジュール。'sway'で高速化（デフォルト: linear）。",
+    )
+    parser.add_argument(
+        "--sway-coeff",
+        type=float,
+        default=-1.0,
+        help="Sway Samplingの係数。負値でノイズ側に解像度を集中（デフォルト: -1.0）。",
+    )
+    parser.add_argument(
         "--num-candidates",
         type=int,
         default=1,
@@ -464,6 +476,8 @@ def main() -> None:
             if args.speaker_kv_max_layers is None
             else int(args.speaker_kv_max_layers),
             seed=None if args.seed is None else int(args.seed),
+            t_schedule_mode=str(args.t_schedule_mode),
+            sway_coeff=float(args.sway_coeff),
             trim_tail=bool(args.trim_tail),
             tail_window_size=int(args.tail_window_size),
             tail_std_threshold=float(args.tail_std_threshold),

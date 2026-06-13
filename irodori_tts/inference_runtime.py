@@ -604,12 +604,20 @@ class InferenceRuntime:
         model_state, model_cfg_dict, train_cfg = _load_checkpoint_for_inference(
             Path(key.checkpoint)
         )
-        # チェックポイントの model_config に ModelConfig に存在しないキーが
-        # 含まれる場合そのまま展開すると TypeError になるため
-        # dataclass フィールドでフィルタしてから展開する。
-        _mc_fields = ModelConfig.__dataclass_fields__
-        model_cfg = ModelConfig(**{k: v for k, v in model_cfg_dict.items()
-                                   if hasattr(ModelConfig, k) or k in _mc_fields})
+        # 新しいチェックポイント（600M VoiceDesign等）対応:
+        # config の use_speaker_condition は ModelConfig ではフィールド化された
+        # use_speaker_condition_field にマッピングする（プロパティ名との衝突回避）。
+        _cfg = dict(model_cfg_dict)
+        if "use_speaker_condition" in _cfg:
+            _cfg["use_speaker_condition_field"] = _cfg.pop("use_speaker_condition")
+        # それでも ModelConfig に無いキーは無視する。
+        from dataclasses import fields as _dc_fields
+        _allowed = {f.name for f in _dc_fields(ModelConfig)}
+        _filtered = {k: v for k, v in _cfg.items() if k in _allowed}
+        _ignored = sorted(set(_cfg) - _allowed)
+        if _ignored:
+            print(f"[config] 未知のモデル設定キーを無視: {_ignored}")
+        model_cfg = ModelConfig(**_filtered)
 
         model = TextToLatentRFDiT(model_cfg).to(model_device)
         model.load_state_dict(model_state, strict=False)
